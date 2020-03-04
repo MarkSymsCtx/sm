@@ -1,3 +1,4 @@
+
 #!/usr/bin/python
 #
 # Copyright (C) Citrix Systems Inc.
@@ -79,6 +80,9 @@ VAR_RUN = "/var/run/"
 SPEED_LOG_ROOT = VAR_RUN + "{uuid}.speed_log"
 
 N_RUNNING_AVERAGE = 10
+
+# XSI-629. Sometime reloadChildren doesn't see the new state so have to retry
+MAX_INACTIVE_RETRY = 3
 
 class AbortException(util.SMException):
     pass
@@ -2647,18 +2651,32 @@ class LVHDSR(SR):
                 "ns2"    : lvhdutil.NS_PREFIX_LVM + self.uuid}
         onlineHosts = self.xapi.getOnlineHosts()
         abortFlag = IPCFlag(self.uuid)
-        for pbdRecord in self.xapi.getAttachedPBDs():
-            hostRef = pbdRecord["host"]
-            if hostRef == self.xapi._hostRef:
-                continue
-            if abortFlag.test(FLAG_TYPE_ABORT):
-                raise AbortException("Aborting due to signal")
-            Util.log("Checking with slave %s (path %s)" % (hostRef, vdi.path))
-            try:
-                self.xapi.ensureInactive(hostRef, args)
-            except XenAPI.Failure:
-                if hostRef in onlineHosts:
-                    raise
+        Util.log('_checkSlaves VDI parent is {}'.format(vdi.parent))
+        retry = True
+        retryCount = 0
+        while retry:
+            retry = False
+            for pbdRecord in self.xapi.getAttachedPBDs():
+                hostRef = pbdRecord["host"]
+                if hostRef == self.xapi._hostRef:
+                    continue
+                if abortFlag.test(FLAG_TYPE_ABORT):
+                    raise AbortException("Aborting due to signal")
+                Util.log("Checking with slave %s (path %s)" % (hostRef, vdi.path))
+                try:
+                    self.xapi.ensureInactive(hostRef, args)
+                except XenAPI.Failure:
+                    if hostRef in onlineHosts:
+                        if retryCount >= MAX_INACTIVE_RETRY:
+                            raise
+                        retry = True
+
+            if not retry:
+                break
+            # Need to retry so, refresh the children of the parent
+            Util.log('_checkSlaves: ensureInactive failed, reload children again')
+            vdi.parent._reloadChildren(vdi)
+            retryCount += 1
 
     def _updateSlavesOnUndoLeafCoalesce(self, parent, child):
         slaves = util.get_slaves_attached_on(self.xapi.session, [child.uuid])
